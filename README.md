@@ -1,1 +1,1 @@
-# Mój projekt będzie polegal na zrobieniu gry 2D lub 3D ktorą można będzie grać online 
+# Mój projekt będzie polegal na zrobieniu gry karcianej pod nazwą "Dureń" w 2D lub 3D ktorą można będzie grać online lub z botem

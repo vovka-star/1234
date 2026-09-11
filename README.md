@@ -1,1 +1,1 @@
-# 1234
+# Mój projekt będzie polegal na zrobieniu gry 2D lub 3D ktorą można będzie grać online 

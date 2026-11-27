@@ -4,29 +4,42 @@ using System.Linq;
 
 namespace Duren
 {
-    // Dwuosobowy "Dureń podrzucany": 36 kart, po 6 na reke, atut = kolor ostatniej karty talii.
-    // Tryb przerzucany (Przerzucany = true): obronca, ktory jeszcze nic nie odbil, moze przeniesc atak na przeciwnika
-    // kartą tej samej wartosci (Przenies). Atut o tej wartosci mozna tylko POKAZAC (zostaje na rece),
-    // ale kazdy atut mozna pokazac tylko raz; przy kolejnym przeniesieniu trzeba go wylozyc.
-    // Wylozona karta, ktora przeciwnik zabierze na reke, moze byc przez niego znowu raz pokazana.
-    // Atakujacy kladzie karty pojedynczo. Gdy obronca zabiera karty (Stan = Dorzucanie),
-    // atakujacy moze jeszcze dolozyc karty o wartosciach ze stolu, a potem konczy ("Pas").
+    // Dureń podrzucany dla 2-4 graczy: 36 kart, po 6 na reke, atut = kolor ostatniej karty talii.
+    //
+    // Role w turze:
+    //  - Glowny    - gracz, ktory zaczal ture (kladzie pierwsza karte),
+    //  - Obronca   - gracz po lewej od Glownego (nastepny aktywny),
+    //  - Atakujacy - gracz, ktory ma teraz prawo polozyc/dolozyc karte (na zmiane: wszyscy poza obronca).
+    //
+    // Stan Dorzucanie: obronca zabiera karty, ale wszyscy pozostali gracze moga jeszcze dolozyc karty
+    // o wartosciach ze stolu. Gracze, ktorzy nie moga nic dolozyc, sa pomijani automatycznie.
+    //
+    // Tryb przerzucany (Przerzucany = true): obronca, ktory jeszcze nic nie odbil, moze przeniesc atak
+    // na nastepnego gracza karta tej samej wartosci (Przenies). Atut o tej wartosci mozna tylko POKAZAC
+    // (zostaje na rece), ale kazdy atut mozna pokazac tylko raz; przy kolejnym przeniesieniu trzeba go wylozyc.
+    // Wylozona karta, ktora ktos zabierze na reke, moze byc przez niego znowu raz pokazana.
+    //
+    // Koniec: gdy talia jest pusta, gracze bez kart "wychodza". Ostatni gracz z kartami to dureń.
     public class Gra
     {
         public const int MaxPar = 6;
 
         private readonly List<Gracz> gracze;
         private readonly Random rnd;
+        private readonly HashSet<Gracz> wyszli = new HashSet<Gracz>();
+        private readonly List<Gracz> kolejnoscWyjscia = new List<Gracz>();
+        private int pasy; // ilu dokladajacych z rzedu spasowalo od ostatniej polozonej karty
 
         public Talia Talia { get; private set; }
         public Stol Stol { get; } = new Stol();
         public IReadOnlyList<Gracz> Gracze => gracze;
+        public Gracz Glowny { get; private set; }
         public Gracz Atakujacy { get; private set; }
         public Gracz Obronca { get; private set; }
         public StanGry Stan { get; private set; } = StanGry.Przygotowanie;
         public Kolor Atut => Talia.Atut;
 
-        // Wynik: Zwyciezca to gracz, ktory pozbyl sie kart; Przegrany to "dureń".
+        // Wynik: Zwyciezca to pierwszy gracz, ktory pozbyl sie kart; Przegrany to "dureń".
         public Gracz Zwyciezca { get; private set; }
         public Gracz Przegrany { get; private set; }
         public bool Remis { get; private set; }
@@ -40,8 +53,15 @@ namespace Duren
         public bool Przerzucany { get; }
 
         public Gra(Gracz a, Gracz b, Random rnd = null, bool przerzucany = false)
+            : this(new List<Gracz> { a, b }, rnd, przerzucany)
         {
-            gracze = new List<Gracz> { a, b };
+        }
+
+        public Gra(IEnumerable<Gracz> uczestnicy, Random rnd = null, bool przerzucany = false)
+        {
+            gracze = uczestnicy.ToList();
+            if (gracze.Count < 2 || gracze.Count > 4)
+                throw new ArgumentException("W grze moze brac udzial od 2 do 4 graczy.");
             this.rnd = rnd ?? new Random();
             Przerzucany = przerzucany;
         }
@@ -56,6 +76,8 @@ namespace Duren
             Przegrany = null;
             Remis = false;
             OstatnieZdarzenie = "";
+            wyszli.Clear();
+            kolejnoscWyjscia.Clear();
 
             foreach (Gracz g in gracze)
             {
@@ -67,18 +89,26 @@ namespace Duren
                 ?? gracze.Where(g => g.NajmniejszyAtut(Atut) != null)
                          .OrderBy(g => g.NajmniejszyAtut(Atut).Wartosc)
                          .FirstOrDefault()
-                ?? gracze[rnd.Next(2)];
+                ?? gracze[rnd.Next(gracze.Count)];
 
-            UstawRole(start);
+            UstawTure(start);
             Stan = StanGry.Atak;
         }
 
-        // "Zagraj ponownie": zaczyna ten, kto wygral poprzednia gre.
+        // "Zagraj ponownie": zaczyna ten, kto pierwszy pozbyl sie kart w poprzedniej grze.
         public void ZagrajPonownie()
         {
             Start(Zwyciezca);
         }
 
+        public bool CzyWyszedl(Gracz g)
+        {
+            return wyszli.Contains(g);
+        }
+
+        // ------------------------------------------------------------ ruchy graczy
+
+        // Atakujacy (aktualny dokladajacy) kladzie karte.
         public bool Atakuj(Karta k)
         {
             if (Stan != StanGry.Atak && Stan != StanGry.Dorzucanie) return false;
@@ -90,15 +120,22 @@ namespace Duren
 
             Atakujacy.ZagrajKarte(k);
             Stol.DodajAtak(k);
+            pasy = 0;
             if (Stan == StanGry.Atak) Stan = StanGry.Obrona;
             return true;
         }
 
+        // Obrona pierwszej nieodbitej karty (uzywane m.in. przez bota).
         public bool Obron(Karta k)
         {
+            return Obron(k, Stol.PierwszaNieodbita);
+        }
+
+        // Obrona wybranej karty ze stolu: obronca sam decyduje, ktora karte ataku odbija.
+        public bool Obron(Karta k, ParaKart para)
+        {
             if (Stan != StanGry.Obrona) return false;
-            ParaKart para = Stol.PierwszaNieodbita;
-            if (para == null) return false;
+            if (para == null || para.CzyOdbita || !Stol.Pary.Contains(para)) return false;
             if (!Obronca.Reka.Contains(k)) return false;
             if (!k.CzyBije(para.Atak, Atut)) return false;
 
@@ -119,81 +156,60 @@ namespace Duren
             if (k.Wartosc != Stol.Pary[0].Atak.Wartosc) return false;
             if (pokaz && (k.Kolor != Atut || k.Odslonieta)) return false;
 
+            Gracz nowy = NastepnyAktywny(Obronca);
+            if (nowy == null || nowy == Obronca) return false;
+
             int naStole = Stol.LiczbaPar + (pokaz ? 0 : 1);
-            return naStole <= MaxPar && naStole <= Atakujacy.LiczbaKart;
+            return naStole <= MaxPar && naStole <= nowy.LiczbaKart;
         }
 
         public bool Przenies(Karta k, bool pokaz)
         {
             if (!CzyMoznaPrzeniesc(k, pokaz)) return false;
 
+            Gracz przenoszacy = Obronca;
+            Gracz nowy = NastepnyAktywny(przenoszacy);
+
             if (pokaz)
             {
                 k.Odslonieta = true;
-                OstatnieZdarzenie = Obronca.Nazwa + " przenosi atak i pokazuje atut: " + Symbol(k);
+                OstatnieZdarzenie = przenoszacy.Nazwa + " przenosi atak i pokazuje atut: " + Symbol(k);
             }
             else
             {
-                Obronca.ZagrajKarte(k);
+                przenoszacy.ZagrajKarte(k);
                 Stol.DodajAtak(k);
-                OstatnieZdarzenie = Obronca.Nazwa + " przenosi atak kartą: " + Symbol(k);
+                OstatnieZdarzenie = przenoszacy.Nazwa + " przenosi atak kartą: " + Symbol(k);
             }
 
-            UstawRole(Obronca); // przenoszacy staje po stronie ataku, przeciwnik musi sie bronic
+            // przenoszacy staje po stronie ataku, atak idzie na kolejnego gracza
+            Glowny = przenoszacy;
+            Atakujacy = przenoszacy;
+            Obronca = nowy;
+            pasy = 0;
             Stan = StanGry.Obrona;
             return true;
         }
 
-        private static string Symbol(Karta k)
-        {
-            string s;
-            switch (k.Kolor)
-            {
-                case Kolor.Pik: s = "♠"; break;
-                case Kolor.Kier: s = "♥"; break;
-                case Kolor.Karo: s = "♦"; break;
-                default: s = "♣"; break;
-            }
-            return ((int)k.Wartosc <= 10 ? ((int)k.Wartosc).ToString() : k.Wartosc.ToString()) + s;
-        }
-
-        // Obronca nie moze albo nie chce sie bronic: atakujacy moze jeszcze dokladac karty.
+        // Obronca nie moze albo nie chce sie bronic: pozostali gracze moga jeszcze dokladac karty.
         public bool Zabierz()
         {
             if (Stan != StanGry.Obrona) return false;
             Stan = StanGry.Dorzucanie;
+            pasy = 0;
+            // jesli aktualny dokladajacy nic nie moze dolozyc, kolej przechodzi dalej (a gdy nikt - obronca bierze karty)
+            if (!MozeDolozyc(Atakujacy)) return PrzekazDokladanie(true);
             return true;
         }
 
-        // Atakujacy konczy dokladanie.
-        // - Stan Dorzucanie: obronca zabiera wszystkie karty, atakujacy zostaje atakujacym.
-        // - Stan Atak i wszystko odbite: "bito", role sie zamieniaja.
+        // Aktualny dokladajacy rezygnuje z dokladania.
+        // - Stan Dorzucanie: kolej przechodzi na nastepnego; gdy wszyscy spasuja, obronca zabiera karty.
+        // - Stan Atak i wszystko odbite: kolej na nastepnego; gdy wszyscy spasuja, tura konczy sie "bito".
         public bool Pas()
         {
-            if (Stan == StanGry.Dorzucanie)
-            {
-                OstatnieZdarzenie = "";
-                Obronca.DodajKarty(Stol.ZabierzKarty());
-                DobierzKarty(Atakujacy, Obronca);
-                if (SprawdzKoniec()) return true;
-
-                Stan = StanGry.Atak;
-                return true;
-            }
-
-            if (Stan != StanGry.Atak || !Stol.CzyWszystkieOdbite) return false;
-
-            OstatnieZdarzenie = "";
-            Gracz staryAtakujacy = Atakujacy;
-            Gracz staryObronca = Obronca;
-
-            Stol.Wyczysc();
-            DobierzKarty(staryAtakujacy, staryObronca);
-            if (SprawdzKoniec()) return true;
-
-            UstawRole(staryObronca); // obronca, ktory sie obronil, atakuje w nastepnej turze
-            Stan = StanGry.Atak;
-            return true;
+            if (Stan == StanGry.Dorzucanie) return PrzekazDokladanie(true);
+            if (Stan == StanGry.Atak && Stol.CzyWszystkieOdbite) return PrzekazDokladanie(false);
+            return false;
         }
 
         // Wykonuje jeden ruch bota. Zwraca false, gdy ruch nalezy do czlowieka albo gra sie skonczyla.
@@ -224,39 +240,153 @@ namespace Duren
             return false;
         }
 
-        private void UstawRole(Gracz atakujacy)
+        // ------------------------------------------------------------ koniec tury
+
+        private bool PrzekazDokladanie(bool obroncaZabiera)
         {
-            Atakujacy = atakujacy;
-            Obronca = gracze[0] == atakujacy ? gracze[1] : gracze[0];
+            int ilu = Dokladajacy().Count;
+            pasy++; // aktualny dokladajacy spasowal
+            while (pasy < ilu)
+            {
+                Atakujacy = NastepnyDokladajacy(Atakujacy);
+                if (MozeDolozyc(Atakujacy)) return true; // ten gracz ma jeszcze mozliwosc dolozenia
+                pasy++;                                   // nie moze, wiec pasuje automatycznie
+            }
+            return obroncaZabiera ? ZakonczBranieKart() : ZakonczBito();
         }
 
-        private void DobierzKarty(Gracz pierwszy, Gracz drugi)
+        private bool ZakonczBranieKart()
         {
-            pierwszy.DobierzDoSzesciu(Talia);
-            drugi.DobierzDoSzesciu(Talia);
+            OstatnieZdarzenie = "";
+            Obronca.DodajKarty(Stol.ZabierzKarty());
+            DobierzKartyWszyscy();
+            if (SprawdzKoniec()) return true;
+
+            // obronca stracil kolejke: atakuje gracz po nim
+            UstawTure(NastepnyAktywny(Obronca));
+            Stan = StanGry.Atak;
+            return true;
         }
 
-        // Gra konczy sie, gdy talia jest pusta i ktorys gracz nie ma kart.
+        private bool ZakonczBito()
+        {
+            OstatnieZdarzenie = "";
+            Gracz staryObronca = Obronca;
+            Stol.Wyczysc();
+            DobierzKartyWszyscy();
+            if (SprawdzKoniec()) return true;
+
+            // obronca, ktory sie obronil, atakuje w nastepnej turze (chyba ze juz wyszedl z gry)
+            Gracz nowyGlowny = wyszli.Contains(staryObronca) ? NastepnyAktywny(staryObronca) : staryObronca;
+            UstawTure(nowyGlowny);
+            Stan = StanGry.Atak;
+            return true;
+        }
+
+        // Dobieranie do 6 kart: najpierw glowny atakujacy i kolejni gracze, obronca na koncu.
+        private void DobierzKartyWszyscy()
+        {
+            foreach (Gracz g in AktywniOd(Glowny))
+                if (g != Obronca) g.DobierzDoSzesciu(Talia);
+            Obronca.DobierzDoSzesciu(Talia);
+        }
+
+        // Gra konczy sie, gdy talia jest pusta i zostaje najwyzej jeden gracz z kartami.
         private bool SprawdzKoniec()
         {
             if (!Talia.CzyPusta) return false;
 
-            bool pusty0 = gracze[0].LiczbaKart == 0;
-            bool pusty1 = gracze[1].LiczbaKart == 0;
-            if (!pusty0 && !pusty1) return false;
+            foreach (Gracz g in gracze)
+            {
+                if (!wyszli.Contains(g) && g.LiczbaKart == 0)
+                {
+                    wyszli.Add(g);
+                    kolejnoscWyjscia.Add(g);
+                }
+            }
+
+            List<Gracz> pozostali = gracze.Where(g => !wyszli.Contains(g)).ToList();
+            if (pozostali.Count > 1) return false;
 
             Stan = StanGry.Koniec;
-            if (pusty0 && pusty1)
+            if (pozostali.Count == 1)
             {
-                Remis = true;
+                Przegrany = pozostali[0];
+                Zwyciezca = kolejnoscWyjscia[0];
             }
             else
             {
-                Zwyciezca = pusty0 ? gracze[0] : gracze[1];
-                Przegrany = pusty0 ? gracze[1] : gracze[0];
+                Remis = true;
             }
             KoniecGry?.Invoke(this);
             return true;
+        }
+
+        // ------------------------------------------------------------ pomocnicze
+
+        private void UstawTure(Gracz glowny)
+        {
+            Glowny = glowny;
+            Atakujacy = glowny;
+            Obronca = NastepnyAktywny(glowny);
+            pasy = 0;
+        }
+
+        // Gracze, ktorzy jeszcze nie wyszli, w kolejnosci przy stole, zaczynajac od g.
+        private List<Gracz> AktywniOd(Gracz g)
+        {
+            int start = gracze.IndexOf(g);
+            var wynik = new List<Gracz>();
+            for (int i = 0; i < gracze.Count; i++)
+            {
+                Gracz c = gracze[(start + i) % gracze.Count];
+                if (!wyszli.Contains(c)) wynik.Add(c);
+            }
+            return wynik;
+        }
+
+        private Gracz NastepnyAktywny(Gracz g)
+        {
+            int idx = gracze.IndexOf(g);
+            for (int krok = 1; krok < gracze.Count; krok++)
+            {
+                Gracz c = gracze[(idx + krok) % gracze.Count];
+                if (!wyszli.Contains(c)) return c;
+            }
+            return null;
+        }
+
+        // Gracze, ktorzy moga dokladac karty: wszyscy aktywni poza obronca, zaczynajac od glownego atakujacego.
+        private List<Gracz> Dokladajacy()
+        {
+            return AktywniOd(Glowny).Where(g => g != Obronca).ToList();
+        }
+
+        private Gracz NastepnyDokladajacy(Gracz g)
+        {
+            List<Gracz> d = Dokladajacy();
+            int i = d.IndexOf(g);
+            return d[(i + 1) % d.Count];
+        }
+
+        private bool MozeDolozyc(Gracz g)
+        {
+            if (Stol.LiczbaPar >= MaxPar) return false;
+            if (Stol.LiczbaNieodbitych + 1 > Obronca.LiczbaKart) return false;
+            return g.Reka.Any(k => Stol.CzyMoznaDorzucic(k));
+        }
+
+        private static string Symbol(Karta k)
+        {
+            string s;
+            switch (k.Kolor)
+            {
+                case Kolor.Pik: s = "♠"; break;
+                case Kolor.Kier: s = "♥"; break;
+                case Kolor.Karo: s = "♦"; break;
+                default: s = "♣"; break;
+            }
+            return ((int)k.Wartosc <= 10 ? ((int)k.Wartosc).ToString() : k.Wartosc.ToString()) + s;
         }
     }
 }
